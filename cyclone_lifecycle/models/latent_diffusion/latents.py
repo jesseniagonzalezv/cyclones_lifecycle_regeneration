@@ -17,8 +17,8 @@ from typing import List, Optional
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-import config as cfg
-from vae import file_stamp
+from ... import config as cfg
+from .vae import file_stamp
 
 WINDOW_GLOB = "latent_track*.pt"
 

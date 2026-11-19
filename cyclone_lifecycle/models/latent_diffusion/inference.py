@@ -17,14 +17,14 @@ of their cached latents. Take x_hat[list(missing)] for the predicted days only.
 """
 from typing import Optional, Sequence, Union
 
-import config as cfg
+from ... import config as cfg
 import numpy as np
 import torch
-from diffusion import ddim_sample, load_trained_diffusion
-from latents import augment_with_patch_mean
-from vae import load_vae
+from .diffusion import ddim_sample, load_trained_diffusion
+from .latents import augment_with_patch_mean
+from .vae import load_vae
 
-from data import denormalize
+from ...dataset import denormalize
 
 
 class LatentImputer:

@@ -19,7 +19,7 @@ import csv
 import json
 from pathlib import Path
 
-import config as cfg
+from .. import config as cfg
 
 OCN = ["avg_tos", "avg_zos", "avg_sos", "avg_mlotst125"]
 UNITS = {"avg_tos": "°C", "avg_zos": "m", "avg_sos": "psu", "avg_mlotst125": "m"}

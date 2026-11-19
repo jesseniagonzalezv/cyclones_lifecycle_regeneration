@@ -44,8 +44,8 @@ TRACKS_CSV = Path("/ontap/user/jgonzale/TC_diagnostic/data/tracks.csv")
 PROJECT_ROOT = Path("/ontap/user/jgonzale/cyclone_atm")
 
 TRAIN_CSV = PROJECT_ROOT / "data/train.csv"  #6534 samples ? check false
-TEST_CSV = PROJECT_ROOT / "data/eval.csv" #1587
-VAL_CSV = PROJECT_ROOT / "data/holdout.csv" #1587
+TEST_CSV = PROJECT_ROOT / "data/test.csv" #1587
+VAL_CSV = PROJECT_ROOT / "data/val.csv" #1587
 
 # houldout 1566
 

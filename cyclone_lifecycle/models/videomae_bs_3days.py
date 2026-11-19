@@ -66,7 +66,6 @@ size by 3 -- with no need to regenerate your NetCDF files.
 """
 
 import argparse
-import glob
 import json
 import os
 import random
@@ -76,7 +75,6 @@ import matplotlib
 import numpy as np
 import torch
 import torch.nn.functional as F
-import xarray as xr
 
 matplotlib.use("Agg")
 from dataclasses import dataclass, field
@@ -85,8 +83,21 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import VideoMAEConfig, VideoMAEForPreTraining
+
+from ..dataset import (
+    NetCDFSpatioTemporalDataset,
+    SampleMetadata,
+    compute_normalization_stats,
+    denormalize_channels as denormalize,
+    load_norm_stats,
+    parse_patch_filename,
+    save_norm_stats,
+)
+from ..metrics import UNIT_SCALE_FOR_STD, compute_row_metrics as _compute_row_metrics
+from ..metrics import get_dataset_std as _get_dataset_std
+from ..plotting import convert_for_display, plot_comparison_triplet
 
 
 # =====================================================================================
@@ -213,323 +224,6 @@ class ProjectConfig:
             norm_pix_loss=False,
             use_mean_pooling=False,
         )
-
-
-# =====================================================================================
-# 2) DATASET  (NetCDF -> tensor [C, T, H, W] + per-channel Z-score normalization)
-# =====================================================================================
-class NetCDFSpatioTemporalDataset(Dataset):
-    """
-    Internal layout: [C, T, H, W] (channel-major), as requested in the spec.
-    Conversion to [T, C, H, W] (HuggingFace's expected layout) only ever happens
-    in model_utils / to_model_layout, never here.
-
-    Supports two modes, controlled by `flatten_time`:
-      - flatten_time=False: one sample per file, with T = file_num_frames.
-      - flatten_time=True:  one sample per (file, day) pair, with T = 1. This lets
-        you reuse multi-day .nc files as independent single-timestep samples.
-    """
-
-    def __init__(
-        self,
-        directory: str,
-        variable_names: List[str],
-        file_num_frames: int,
-        image_size: int,
-        norm_stats: Optional[Dict[str, Dict[str, float]]] = None,
-        flatten_time: bool = False,
-    ):
-        self.files = sorted(glob.glob(os.path.join(directory, "*.nc")))
-        if len(self.files) == 0:
-            raise FileNotFoundError(f"No .nc files found under {directory}")
-        self.variable_names = variable_names
-        self.file_num_frames = file_num_frames
-        self.image_size = image_size
-        self.norm_stats = norm_stats  # {var: {"mean":.., "std":..}}; None -> raw tensor
-        self.flatten_time = flatten_time
-
-    def __len__(self) -> int:
-        if self.flatten_time:
-            return len(self.files) * self.file_num_frames
-        return len(self.files)
-
-    def _load_raw_file(self, path: str) -> torch.Tensor:
-        """Reads one .nc file and stacks its variables into [C, file_num_frames, H, W]."""
-        ds = xr.open_dataset(path)
-        channel_arrays = []
-        for var in self.variable_names:
-            if var not in ds.variables:
-                raise KeyError(f"Variable '{var}' not found in {path}. "
-                                f"Available: {list(ds.variables.keys())}")
-            arr = np.asarray(ds[var].values, dtype=np.float32)  # expected shape (T_file, H, W)
-            if arr.shape != (self.file_num_frames, self.image_size, self.image_size):
-                raise ValueError(
-                    f"Variable '{var}' in {path} has shape {arr.shape}, "
-                    f"expected ({self.file_num_frames}, {self.image_size}, {self.image_size})"
-                )
-            channel_arrays.append(arr)
-        ds.close()
-        stacked = np.stack(channel_arrays, axis=0)  # [C, file_num_frames, H, W]
-        return torch.from_numpy(stacked)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        if self.flatten_time:
-            file_idx = idx // self.file_num_frames
-            day_idx = idx % self.file_num_frames
-            full_tensor = self._load_raw_file(self.files[file_idx])   # [C, file_num_frames, H, W]
-            tensor = full_tensor[:, day_idx:day_idx + 1, :, :].clone()  # [C, 1, H, W]
-        else:
-            tensor = self._load_raw_file(self.files[idx])             # [C, file_num_frames, H, W]
-
-        if self.norm_stats is not None:
-            for c, var in enumerate(self.variable_names):
-                mean = self.norm_stats[var]["mean"]
-                std = self.norm_stats[var]["std"]
-                tensor[c] = (tensor[c] - mean) / (std + 1e-8)
-
-        return tensor
-
-    def get_metadata(self, idx: int, frame_idx: Optional[int] = None) -> "SampleMetadata":
-        """
-        Reads everything needed to plot and name a sample properly: the track
-        filename fields (track_id/season/basin/rank), the lat/lon coordinate
-        arrays, the cyclone center for the selected timestep, and the
-        timestamp string. This is deliberately kept OUT of __getitem__ (which
-        must stay a plain tensor for DataLoader batching/collation) and is
-        only called directly for inference/visualization, one sample at a time.
-
-        If `flatten_time` is False (one sample per file containing multiple
-        timesteps), callers can pass `frame_idx` to select which timestep's
-        per-frame metadata (time, cyclone center) to return. If `frame_idx`
-        is omitted, a sensible default (middle timestep) is used so plots can
-        show different times instead of always the same first timestep.
-        """
-        if self.flatten_time:
-            file_idx = idx // self.file_num_frames
-            day_idx = idx % self.file_num_frames
-        else:
-            file_idx = idx
-            # choose frame index for per-timestep metadata: prefer explicit
-            # `frame_idx`; if not provided, use middle frame so plots vary
-            # across time instead of always using the first timestep.
-            if frame_idx is None:
-                day_idx = self.file_num_frames // 2
-            else:
-                day_idx = int(frame_idx) % self.file_num_frames
-
-        path = self.files[file_idx]
-        ds = xr.open_dataset(path)
-
-        # file_info = parse_patch_filename(path)
-        file_info = parse_patch_filename(ds)
-
-        # lat/lon are expected as 1D coordinate arrays of length H and W
-        # respectively (standard for a lat/lon patch grid).
-        # here the 3 timesteps has the same, lat, lon double absolute_lat(time, lat) ; double absolute_lon(time, lon) ;
-        lat = np.asarray(ds["absolute_lat"][0].values, dtype=np.float64) if "absolute_lat" in ds.coords or "absolute_lat" in ds.variables else None
-        lon = np.asarray(ds["absolute_lon"][0].values, dtype=np.float64) if "absolute_lon" in ds.coords or "absolute_lon" in ds.variables else None
-
-        # cyclone_center_lat/lon and time can be stored either as a single
-        # scalar (one value for the whole file) or as one value per
-        # timestep (shape [file_num_frames]) -- handle both.
-        def _select_scalar_or_indexed(var_name: str):
-            if var_name not in ds.variables:
-                return None
-            values = np.asarray(ds[var_name].values)
-            if values.ndim == 0 or values.size == 1:
-                return values.reshape(-1)[0]
-            return values[day_idx]
-
-        # cyclone center can be scalar or per-timestep; collect both
-        latc = _select_scalar_or_indexed("cyclone_center_lat")
-        lonc = _select_scalar_or_indexed("cyclone_center_lon")
-
-        # Build per-timestep arrays for time and cyclone center when available
-        time_val = None
-        time_strs = None
-        if "time" in ds.variables or "time" in ds.coords:
-            time_raw = np.asarray(ds["time"].values)
-            if time_raw.ndim == 0:
-                time_single = time_raw
-                time_val = np.datetime_as_string(time_single, unit="h")
-                time_strs = [time_val]
-            else:
-                # array of times per file frame
-                time_strs = [np.datetime_as_string(t, unit="h") for t in time_raw]
-                time_val = time_strs[day_idx]
-
-        cyclone_center_lats = None
-        cyclone_center_lons = None
-        if "cyclone_center_lat" in ds.variables:
-            vals = np.asarray(ds["cyclone_center_lat"].values)
-            if vals.ndim == 0 or vals.size == 1:
-                cyclone_center_lats = np.array([float(vals.reshape(-1)[0])])
-            else:
-                cyclone_center_lats = np.asarray(vals, dtype=np.float64)
-        if "cyclone_center_lon" in ds.variables:
-            vals = np.asarray(ds["cyclone_center_lon"].values)
-            if vals.ndim == 0 or vals.size == 1:
-                cyclone_center_lons = np.array([float(vals.reshape(-1)[0])])
-            else:
-                cyclone_center_lons = np.asarray(vals, dtype=np.float64)
-
-        ds.close()
-
-        return SampleMetadata(
-            source_file=path,
-            track_id=file_info.get("track_id") if file_info else None,
-            season=file_info.get("season") if file_info else None,
-            basin=file_info.get("basin") if file_info else None,
-            rank=file_info.get("rank") if file_info else None,
-            win_idx=file_info.get("win_idx") if file_info else None,
-            lat=lat,
-            lon=lon,
-            cyclone_center_lat=float(latc) if latc is not None and np.ndim(latc) == 0 else (
-                float(cyclone_center_lats[len(cyclone_center_lats) // 2]) if cyclone_center_lats is not None else None
-            ),
-            cyclone_center_lon=float(lonc) if lonc is not None and np.ndim(lonc) == 0 else (
-                float(cyclone_center_lons[len(cyclone_center_lons) // 2]) if cyclone_center_lons is not None else None
-            ),
-            time_str=time_val,
-            time_strs=time_strs,
-            cyclone_center_lats=cyclone_center_lats,
-            cyclone_center_lons=cyclone_center_lons,
-        )
-
-
-@dataclass
-class SampleMetadata:
-    """Everything needed to title/name/geolocate a plot for one sample."""
-    source_file: str
-    track_id: Optional[str]
-    season: Optional[str]
-    basin: Optional[str]
-    rank: Optional[str]
-    win_idx: Optional[str]
-    lat: Optional[np.ndarray]           # 1D array, length H
-    lon: Optional[np.ndarray]           # 1D array, length W
-    # Per-sample scalar metadata (keeps backwards compatibility): a
-    # representative value (e.g. middle timestep) for convenience.
-    cyclone_center_lat: Optional[float]
-    cyclone_center_lon: Optional[float]
-    time_str: Optional[str]             # e.g. "2020-09-14T06"
-    # Per-timestep metadata (when the source file contains multiple
-    # frames). These are optional; plotting helpers should prefer them
-    # when available and indexed by the displayed frame index.
-    time_strs: Optional[List[str]] = None
-    cyclone_center_lats: Optional[np.ndarray] = None
-    cyclone_center_lons: Optional[np.ndarray] = None
-
-
-# def parse_patch_filename(path: str) -> Optional[Dict[str, str]]:
-#     """
-#     Parses filenames following the convention:
-#         # old: patch_trackid_<track_id>_<season>_<basin>_<rank>...(.nc)
-#     # old:e.g. "patch_trackid_2020123_2020_ATL_01.nc" ->
-#             # patch_trackid_<track_id>_<season>_<basin>_<rank>...(.nc)
-
-#     Returns None (and prints a warning) if the filename doesn't match this
-#     convention -- callers should treat missing metadata gracefully rather
-#     than crash on it.
-#     """
-#     parts = Path(path).stem.split("_")
-#     if len(parts) >= 6 and parts[0] == "patch" and parts[1] == "trackid":
-#         return {
-#             "track_id": parts[2],
-#             "season": parts[3],
-#             "basin": parts[4],
-#             "rank": parts[5],
-#         }
-#     print(f"Unexpected filename format (metadata will be blank): {path}")
-#     return None
-
-def parse_patch_filename(ds: xr.Dataset):
-    """
-    Returns None (and prints a warning) if the filename doesn't match this
-    convention -- callers should treat missing metadata gracefully rather
-    than crash on it.
-    """
-    if ds.attrs:
-        return {
-            "track_id": ds.attrs["track_id"],
-            "season": ds.attrs["season"],
-            "basin": ds.attrs["basin"],
-            "rank": ds.attrs["rank"],
-            "win_idx": ds.attrs["win_idx"],
-
-        }
-    else:
-        print("There are no attributes in this dataset.")
-        return None
-
-
-def compute_normalization_stats(
-    directory: str, variable_names: List[str], file_num_frames: int, image_size: int,
-) -> Dict[str, Dict[str, float]]:
-    """Per-channel mean/std computed over the ENTIRE training set (never over eval)."""
-    raw_dataset = NetCDFSpatioTemporalDataset(
-        directory, variable_names, file_num_frames, image_size, norm_stats=None, flatten_time=False
-    )
-    num_channels = len(variable_names)
-    sum_ = np.zeros(num_channels, dtype=np.float64)
-    sum_sq = np.zeros(num_channels, dtype=np.float64)
-    count = 0
-    for i in range(len(raw_dataset)):
-        tensor = raw_dataset[i].numpy().astype(np.float64)  # [C, T, H, W]
-        c = tensor.shape[0]
-        flat = tensor.reshape(c, -1)
-        sum_ += flat.sum(axis=1)
-        sum_sq += (flat ** 2).sum(axis=1)
-        count += flat.shape[1]
-    mean = sum_ / count
-    var = sum_sq / count - mean ** 2
-    std = np.sqrt(np.maximum(var, 1e-12))
-    return {name: {"mean": float(mean[c]), "std": float(std[c])} for c, name in enumerate(variable_names)}
-
-
-def save_norm_stats(stats: Dict[str, Dict[str, float]], path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(stats, f, indent=2)
-
-
-def load_norm_stats(path: str) -> Dict[str, Dict[str, float]]:
-    with open(path, "r") as f:
-        return json.load(f)
-
-
-def denormalize(
-    pixel_values_ctwh: torch.Tensor, norm_stats: Dict[str, Dict[str, float]], variable_names: List[str],
-) -> torch.Tensor:
-    """
-    Inverse of the Dataset's Z-score normalization: x_physical = x_norm * std + mean.
-    Used ONLY for plotting -- training/inference always operate in normalized
-    space, since that's what the model was trained on. Returns a NEW tensor
-    (does not mutate the input), still in [B, C, T, H, W] project layout.
-    """
-    physical = pixel_values_ctwh.clone()
-    for c, var in enumerate(variable_names):
-        mean = norm_stats[var]["mean"]
-        std = norm_stats[var]["std"]
-        physical[:, c] = physical[:, c] * std + mean
-    return physical
-
-
-# Per-variable display conversion: maps the raw physical value (as stored in the
-# .nc file, e.g. Pa for sea-level pressure) to the unit you actually want to see
-# on a plot, plus a human-readable axis label. Add more entries here as needed;
-# any variable not listed is displayed as-is, labeled with its raw name.
-VARIABLE_DISPLAY_UNITS: Dict[str, Tuple] = {
-    "msl": (lambda x: x / 100.0, "Mean sea level pressure, hPa"),
-}
-
-
-def convert_for_display(variable_name: str, values: np.ndarray) -> Tuple[np.ndarray, str]:
-    """Applies the unit conversion above, if one is registered for this variable."""
-    if variable_name in VARIABLE_DISPLAY_UNITS:
-        convert_fn, label = VARIABLE_DISPLAY_UNITS[variable_name]
-        return convert_fn(values), label
-    return values, variable_name
 
 
 # =====================================================================================
@@ -1290,30 +984,22 @@ def plot_target_pred_diff_grid(
 
         target_frame, var_label = convert_for_display(variable_name, target_frame_raw)
         pred_frame, _ = convert_for_display(variable_name, pred_frame_raw)
-        diff_frame = np.abs(target_frame - pred_frame)
-
-        # Same color scale for Target and Prediction so they are visually
-        # comparable; Difference uses its own scale.
-        vmin = min(target_frame.min(), pred_frame.min())
-        vmax = max(target_frame.max(), pred_frame.max())
-
-        panels = [
-            (target_frame, _build_panel_title("Target", metadata, var_label, frame_idx=t), vmin, vmax, "viridis"),
-            (pred_frame, _build_panel_title("Predicted", metadata, var_label, frame_idx=t), vmin, vmax, "viridis"),
-            (diff_frame, _build_panel_title("Difference", metadata, var_label, frame_idx=t), None, None, "inferno"),
-        ]
-        for col, (frame, subtitle, pmin, pmax, cmap) in enumerate(panels):
+        plot_comparison_triplet(
+            fig,
+            axes[t],
+            target_frame,
+            pred_frame,
+            titles=[
+                _build_panel_title("Target", metadata, var_label, frame_idx=t),
+                _build_panel_title("Predicted", metadata, var_label, frame_idx=t),
+                _build_panel_title("Difference", metadata, var_label, frame_idx=t),
+            ],
+            extent=extent,
+            origin=origin,
+            show_coordinates=has_latlon,
+        )
+        for col in range(3):
             ax = axes[t, col]
-            im = ax.imshow(frame, cmap=cmap, vmin=pmin, vmax=pmax, extent=extent, origin=origin)
-            ax.set_title(subtitle, fontsize=9)
-            if has_latlon:
-                ax.set_xlabel("Longitude")
-                ax.set_ylabel("Latitude")
-            else:
-                ax.axis("off")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-
             if highlight_pixel_box is not None and col < 2:
                 if has_latlon:
                     x0, y0, w, h = _pixel_box_to_lonlat_box(highlight_pixel_box, metadata.lat, metadata.lon)
@@ -1393,27 +1079,23 @@ def plot_all_variables_grid(
 
         target_frame, var_label = convert_for_display(variable_names[c], target_frame_raw)
         pred_frame, _ = convert_for_display(variable_names[c], pred_frame_raw)
-        diff_frame = np.abs(target_frame - pred_frame)
-
-        vmin = min(target_frame.min(), pred_frame.min())
-        vmax = max(target_frame.max(), pred_frame.max())
-
-        panels = [
-            (target_frame, f"{var_label} - Target", vmin, vmax, "viridis"),
-            (pred_frame, f"{var_label} - Predicted", vmin, vmax, "viridis"),
-            (diff_frame, f"{var_label} - Difference", None, None, "inferno"),
-        ]
-        for col, (frame, subtitle, pmin, pmax, cmap) in enumerate(panels):
+        plot_comparison_triplet(
+            fig,
+            axes[c],
+            target_frame,
+            pred_frame,
+            titles=[
+                f"{var_label} - Target",
+                f"{var_label} - Predicted",
+                f"{var_label} - Difference",
+            ],
+            extent=extent,
+            origin=origin,
+            show_coordinates=has_latlon,
+            label_fontsize=8,
+        )
+        for col in range(3):
             ax = axes[c, col]
-            im = ax.imshow(frame, cmap=cmap, vmin=pmin, vmax=pmax, extent=extent, origin=origin)
-            ax.set_title(subtitle, fontsize=9)
-            if has_latlon:
-                ax.set_xlabel("Longitude", fontsize=8)
-                ax.set_ylabel("Latitude", fontsize=8)
-            else:
-                ax.axis("off")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
             if highlight_pixel_box is not None and col < 2:
                 if has_latlon:
                     x0, y0, w, h = _pixel_box_to_lonlat_box(highlight_pixel_box, metadata.lat, metadata.lon)
@@ -1521,98 +1203,6 @@ def plot_all_variables_grid(
 #     predictions_physical = {
 #         label: denormalize(pred, norm_stats, variable_names) for label, pred in predictions.items()
 #     }
-
-
-UNIT_SCALE_FOR_STD = {
-    "msl": 1.0 / 100.0,  # Pa -> hPa
-    # 10u, 10v, avg_tos, avg_zos: adjust if their raw storage units differ from display units
-}
-
-def _box_slice(frame: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
-    """Slice a [H, W] frame down to the highlighted region only.
-    box is (r0, r1, c0, c1) in pixel space — same convention used
-    elsewhere in this function for the rectangle overlay, and valid
-    regardless of whether we're displaying in lat/lon or pixel coords,
-    since the underlying array is always indexed by pixel."""
-    r0, r1, c0, c1 = box
-    return frame[r0:r1, c0:c1]
-
-def _compute_row_metrics(
-    target_frame: np.ndarray,
-    pred_frame: np.ndarray,
-    box: Optional[Tuple[int, int, int, int]] = None,
-    dataset_std: Optional[float] = None,
-) -> Dict[str, float]:
-    """
-    Error metrics for one (variable, model) pair, restricted to `box` if given.
-    Uses the SIGNED error (pred - target)
-    dataset_std: per-channel std from training-set normalization
-    stats (in the SAME physical units as target_frame/pred_frame, i.e.
-    already converted the same way convert_for_display() msl need to divide /100 scale factor before passing in here) .
-    """
-    if box is not None:
-        t = _box_slice(target_frame, box)
-        p = _box_slice(pred_frame, box)
-    else:
-        t = target_frame
-        p = pred_frame
-
-    err = p - t
-
-    metrics = {
-        "mae": float(np.mean(np.abs(err))),
-        "rmse": float(np.sqrt(np.mean(err ** 2))),
-        "bias": float(np.mean(err)),
-    }
-    # nrmse = rmse / std  # in "std-units" -> comparable across variables/rows
-    if dataset_std is not None and dataset_std > 1e-8:
-        metrics["nrmse"] = metrics["rmse"] / dataset_std
-    else:
-        metrics["nrmse"] = None
-    return metrics
-
-# def _get_dataset_std(var_name: str, norm_stats, unit_scale: float = 1.0) -> Optional[float]:
-#     """
-#     Pulls the training-set std for this variable from norm_stats and applies
-#     unit_scale to convert it into the same units convert_for_display() uses
-#     (e.g. 1/100 for Pa->hPa). unit_scale defaults to 1.0 (no conversion needed).
-#     """
-#     target_stats = norm_stats.get("target", norm_stats) if isinstance(norm_stats, dict) else None
-#     if target_stats is None or var_name not in target_stats:
-#         return None
-#     std = target_stats[var_name].get("std")
-#     return std * unit_scale if std is not None else None
-
-def _get_dataset_std(
-    var_name: str, 
-    norm_stats: dict, 
-    label: str = "target", 
-    unit_scale: float = 1.0
-) -> Optional[float]:
-    """
-    Pulls std for `var_name` from `norm_stats`.
-    Handles nested dicts formatted as {label: {var_name: {"std": ...}}}
-    or flat dicts formatted as {var_name: {"std": ...}}.
-    """
-    if not isinstance(norm_stats, dict):
-        return None
-
-    # Determine stats dictionary for the specified label
-    if label in norm_stats and isinstance(norm_stats[label], dict):
-        stats_dict = norm_stats[label]
-    elif "target" in norm_stats and isinstance(norm_stats["target"], dict):
-        stats_dict = norm_stats["target"]
-    else:
-        stats_dict = norm_stats
-
-    # Extract variable-specific stats
-    var_stats = stats_dict.get(var_name)
-    if isinstance(var_stats, dict):
-        std = var_stats.get("std")
-        return std * unit_scale if std is not None else None
-        
-    return None
-
 
 
 def nounits_plot_prediction_comparison(

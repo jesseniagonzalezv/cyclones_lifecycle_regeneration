@@ -1,7 +1,44 @@
 import numpy as np
 import torch
-from difussion_3days import VARS_LIST, impute_missing_timestep
 
+# from difussion_3days import VARS_LIST, impute_missing_timestep
+
+VARS_LIST = ["10u", "10v", "msl", "avg_tos", "avg_zos", "avg_sos", "avg_mlotst125"]
+LATENT_CHANNELS = 128  # Matched with evaluation script expectation
+
+
+def impute_missing_timestep(denoiser, schedule, context, device, scale_factor=1.0, ddim=True, ddim_steps=200):
+    denoiser.eval()
+    B, _, H, W = context.shape
+    shape = (B, LATENT_CHANNELS, H, W)
+    x = torch.randn(shape, device=device) * scale_factor
+
+    timesteps = torch.linspace(schedule.T - 1, 0, ddim_steps, dtype=torch.long, device=device) if ddim else range(schedule.T - 1, -1, -1)
+
+    for i in timesteps:
+        t = torch.full((B,), i, device=device, dtype=torch.long)
+        t_norm = t.float() / schedule.T
+        pred_noise = denoiser(x, t_norm, context)
+
+        alpha_bar = schedule.alpha_bar[i]
+        alpha = schedule.alpha[i]
+
+        if ddim:
+            # DDIM step update
+            pred_x0 = (x - torch.sqrt(1.0 - alpha_bar) * pred_noise) / torch.sqrt(alpha_bar)
+            if i > 0:
+                alpha_bar_prev = schedule.alpha_bar[timesteps[torch.where(timesteps == i)[0] + 1]] if (timesteps == i).nonzero()[0] < len(timesteps) - 1 else torch.tensor(1.0, device=device)
+                dir_xt = torch.sqrt(1.0 - alpha_bar_prev) * pred_noise
+                x = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt
+            else:
+                x = pred_x0
+        else:
+            # DDPM step update
+            beta = schedule.beta[i]
+            noise = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
+            x = 1.0 / torch.sqrt(alpha) * (x - (beta / torch.sqrt(1.0 - alpha_bar)) * pred_noise) + torch.sqrt(beta) * noise
+            
+    return x
 
 def check_times_match(payload, metadata, sample_idx):
     # ----Evaluate the sample and get predicted and target times

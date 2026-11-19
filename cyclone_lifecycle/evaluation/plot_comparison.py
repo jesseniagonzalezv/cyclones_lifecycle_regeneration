@@ -10,49 +10,53 @@ import numpy as np
 import torch
 from transformers import VideoMAEForPreTraining
 
-from diffusion import load_trained_diffusion
-from helper import check_times_match
-from inference import LatentImputer, evaluate_sample
-from ocean_model import (  # ocean fields of the missing day (pixel-space residual U-Net)
+from ..helper import check_times_match
+from ..models.latent_diffusion.diffusion import load_trained_diffusion
+from ..models.latent_diffusion.inference import LatentImputer, evaluate_sample
+from ..models.latent_diffusion.vae import CycloneVAE_Diffusion, load_vae
+from ..models.ocean_model import (  # ocean fields of the missing day (pixel-space residual U-Net)
     OceanImputer,
     fill_ocean_of_prediction,
 )
-from vae import CycloneVAE_Diffusion, load_vae
 
 # from VAE_masked_var_spatial import (
 #     # CycloneVAE,
 #     inferencia_by_sample_case1,
 #     inferencia_by_sample_case2,
 # )
-from vae_case1_case2 import (
+from ..models.vae_case1_case2 import (
     CycloneVAE,
     inferencia_by_sample_case1,
     inferencia_by_sample_case2,
 )
-from videomae_bs_3days import (
-    UNIT_SCALE_FOR_STD,
-    NetCDFSpatioTemporalDataset,
+from ..models.videomae_bs_3days import (
     ProjectConfig,
-    SampleMetadata,
-    _compute_row_metrics,
     _frame_to_numpy,
-    _get_dataset_std,
     build_comparison_filename,
     case3_comparison_rows,
     case_comparison_rows,
-    convert_for_display,
-    denormalize,
     embed_case1_baseline_prediction,
     embed_case3_baseline_prediction,
     get_device,
-    load_norm_stats,
     load_trained_model,
-    parse_patch_filename,
     plot_prediction_comparison,
     reconstruct_case1_model_prediction,
     reconstruct_case2_model_prediction,
     reconstruct_case3_model_prediction,
 )
+from ..dataset import (
+    NetCDFSpatioTemporalDataset,
+    SampleMetadata,
+    denormalize_channels as denormalize,
+    load_norm_stats,
+    parse_patch_filename,
+)
+from ..metrics import (
+    UNIT_SCALE_FOR_STD,
+    compute_row_metrics as _compute_row_metrics,
+    get_dataset_std as _get_dataset_std,
+)
+from ..plotting import convert_for_display
 
 DATA_ROOT  = Path("/scale/project/ifremer-isi-jumeaunumerique/NEXTGEMS_PROCESSED_LAT_LON")
 CHECKPOINT_DIR = DATA_ROOT / "models"
@@ -830,7 +834,7 @@ if __name__ == "__main__":
 #     get_device,
 #     load_norm_stats,
 #     load_trained_model,
-#     parse_patch_filename,
+#     
 #     plot_prediction_comparison,
 #     reconstruct_case1_model_prediction,
 #     reconstruct_case2_model_prediction,

@@ -1,21 +1,10 @@
 
-"""
-Adapted sections for the cyclone VAE (masked reconstruction in space and variable).
-
-REPLACE in your file:  apply_masking, CycloneVAE, VAELoss, MetricsManager,
-                       train_epoch, evaluate_model, run_training
-KEEP as they are:      parse_patch_filename, CyclonePatchDataset, ResBlock,
-                       LatentStatsCollector and your constants
-                       (TRAIN_DIR, TEST_DIR, BATCH_SIZE, EPOCHS, CHECKPOINT, ...)
-"""
+"""Masked VAE for cyclone spatial reconstruction and missing-variable recovery."""
 import gc
-import glob
 import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -27,7 +16,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import xarray as xr
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+
+from ..dataset import MaskedVAEFrameDataset as CyclonePatchDataset
+from ..dataset import SampleMetadata, parse_patch_filename
+from ..metrics import MaskedMetrics
 
 # ==========================================
 # CONFIGURATION & GLOBAL SETUP
@@ -76,146 +69,6 @@ VAR_LABELS = {
 
 
 VARS_LIST = ["10u", "10v", "msl", "avg_tos", "avg_zos", "avg_sos", "avg_mlotst125"]
-
-
-
-def parse_patch_filename(ds: xr.Dataset):
-    """
-    Returns None (and prints a warning) if the filename doesn't match this
-    convention -- callers should treat missing metadata gracefully rather
-    than crash on it.
-    """
-    if ds.attrs:
-        return {
-            "track_id": ds.attrs["track_id"],
-            "season": ds.attrs["season"],
-            "basin": ds.attrs["basin"],
-            "rank": ds.attrs["rank"],
-            "win_idx": ds.attrs["win_idx"],
-
-        }
-    else:
-        print("There are no attributes in this dataset.")
-        return None
-    
-class CyclonePatchDataset(Dataset):
-    def __init__(self, folder_path, variables, stats_dict=None, num_workers=16):
-        self.folder_path = Path(folder_path)
-        self.variables = variables
-        
-        self.files = sorted(glob.glob(os.path.join(folder_path, "*.nc")))
-        if not self.files:
-            raise FileNotFoundError(f"No NetCDF files found in {folder_path}")
-
-        start_time = time.perf_counter()
-
-        # # 1. Store lazy xarray Dataset reference so .ds.isel(time=idx) works for evaluation
-        # self.ds = xr.open_mfdataset(self.files, combine='nested', concat_dim='time')
-
-        # 2. Fast Parallel NetCDF IO into RAM for PyTorch training loop
-        def _load_file(fpath):
-            with xr.open_dataset(fpath) as ds:
-                file_data = np.stack([ds[var].values for var in self.variables], axis=1).astype(np.float32)
-                filename = Path(fpath).name
-                timesteps = file_data.shape[0]
-            return file_data, filename, timesteps
-
-        print(f"[dataset] Loading {len(self.files)} NetCDF files in parallel...")
-        with ThreadPoolExecutor(max_workers=num_workers) as ex:
-            results = list(ex.map(_load_file, self.files))
-
-        # 3. Reconstruct contiguous data array & time_to_filename
-        all_data = []
-        self.time_to_filename = []
-
-        for file_data, filename, timesteps in results:
-            all_data.append(file_data)
-            self.time_to_filename.extend([filename] * timesteps)
-
-        self.data = np.concatenate(all_data, axis=0)
-        del all_data
-
-        # 4. Compute / apply normalization statistics
-        if stats_dict is None:
-            self.stats = {}
-            for i, var in enumerate(self.variables):
-                self.stats[var] = {
-                    'mean': float(self.data[:, i, :, :].mean()),
-                    'std': float(self.data[:, i, :, :].std())
-                }
-        else:
-            self.stats = stats_dict
-
-        for i, var in enumerate(self.variables):
-            mean = self.stats[var]['mean']
-            std = self.stats[var]['std']
-            self.data[:, i, :, :] = (self.data[:, i, :, :] - mean) / (std if std > 1e-6 else 1.0)
-
-        total_elapsed = time.perf_counter() - start_time
-        print(f"[dataset] Total initialization time: {total_elapsed:.3f} s")
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        tensor_sample = torch.from_numpy(self.data[idx])
-        return tensor_sample, tensor_sample, idx
-
-    def get_metadata(self, idx: int) -> "SampleMetadata":
-        """
-        Reads everything needed to plot and name a sample properly: the track
-        filename fields (track_id/season/basin/rank), the lat/lon coordinate
-        arrays, the cyclone center for the selected timestep, and the
-        timestamp string. This is deliberately kept OUT of __getitem__ (which
-        must stay a plain tensor for DataLoader batching/collation) and is
-        only called directly for inference/visualization, one sample at a time.
-        """
-
-        file_idx = idx //3 # self.file_num_frames each file has 3 timesteps, so integer division gives the file index
-        day_idx = idx % 3 #self.file_num_frames each file has 3 timesteps, so modulo gives the day index within the file
-        
-        path = self.files[file_idx]
-        ds = xr.open_dataset(path)
-
-        # file_info = parse_patch_filename(path)
-        file_info = parse_patch_filename(ds)
-
-        lat = np.asarray(ds["absolute_lat"][0].values, dtype=np.float64) if "absolute_lat" in ds.coords or "absolute_lat" in ds.variables else None
-        lon = np.asarray(ds["absolute_lon"][0].values, dtype=np.float64) if "absolute_lon" in ds.coords or "absolute_lon" in ds.variables else None
-
-        # timestep (shape [file_num_frames]) -- handle both.
-        def _select_scalar_or_indexed(var_name: str):
-            if var_name not in ds.variables:
-                return None
-            values = np.asarray(ds[var_name].values)
-            if values.ndim == 0 or values.size == 1:
-                return values.reshape(-1)[0]
-            return values[day_idx]
-
-        latc = _select_scalar_or_indexed("cyclone_center_lat")
-        lonc = _select_scalar_or_indexed("cyclone_center_lon")
-
-        time_val = None
-        if "time" in ds.variables or "time" in ds.coords:
-            time_raw = np.asarray(ds["time"].values)
-            time_single = time_raw if time_raw.ndim == 0 else time_raw[day_idx]
-            time_val = np.datetime_as_string(time_single, unit="h")
-
-        ds.close()
-
-        return SampleMetadata(
-            source_file=path,
-            track_id=file_info.get("track_id") if file_info else None,
-            season=file_info.get("season") if file_info else None,
-            basin=file_info.get("basin") if file_info else None,
-            rank=file_info.get("rank") if file_info else None,
-            win_idx=file_info.get("win_idx") if file_info else None,
-            lat=lat,
-            lon=lon,
-            cyclone_center_lat=float(latc) if latc is not None else None,
-            cyclone_center_lon=float(lonc) if lonc is not None else None,
-            time_str=time_val,
-        )
 
 
 
@@ -468,58 +321,6 @@ class MaskedVAELoss(nn.Module):
 
 
 # ==========================================
-# METRICS (missing region only, streaming: nothing is stored in RAM)
-# ==========================================
-class MaskedMetrics:
-    """MSE / MAE / bias computed ONLY on masked entries (normalised units)."""
-    def __init__(self, variables):
-        self.variables = variables
-        self.reset()
-
-    def reset(self):
-        C, M = len(self.variables), len(MODE_NAMES)
-        z = lambda n: torch.zeros(n, dtype=torch.float64)
-        self.sq, self.ab, self.bi, self.n = z(C), z(C), z(C), z(C)
-        self.m_sq, self.m_n = z(M), z(M)
-
-    @torch.no_grad()
-    def update(self, preds, targets, mask, modes):
-        err = (preds - targets).double()
-        m = mask.double()
-        self.sq += ((err ** 2) * m).sum(dim=(0, 2, 3)).cpu()
-        self.ab += (err.abs() * m).sum(dim=(0, 2, 3)).cpu()
-        self.bi += (err * m).sum(dim=(0, 2, 3)).cpu()
-        self.n += m.sum(dim=(0, 2, 3)).cpu()
-        modes = modes.cpu()
-        self.m_sq.index_add_(0, modes, ((err ** 2) * m).sum(dim=(1, 2, 3)).cpu())
-        self.m_n.index_add_(0, modes, m.sum(dim=(1, 2, 3)).cpu())
-
-    def calculate_metrics(self):
-        nan = float("nan")
-        n_tot = self.n.sum().clamp(min=1)
-        summary = {
-            "overall": {
-                "mse": float(self.sq.sum() / n_tot),
-                "mae": float(self.ab.sum() / n_tot),
-                "bias": float(self.bi.sum() / n_tot),
-            },
-            "per_variable": {},
-            "per_mode": {},
-        }
-        for i, var in enumerate(self.variables):
-            n = float(self.n[i])
-            summary["per_variable"][var] = {
-                "mse": float(self.sq[i]) / n if n > 0 else nan,
-                "mae": float(self.ab[i]) / n if n > 0 else nan,
-                "bias": float(self.bi[i]) / n if n > 0 else nan,
-            }
-        for k, name in enumerate(MODE_NAMES):
-            n = float(self.m_n[k])
-            summary["per_mode"][name] = float(self.m_sq[k]) / n if n > 0 else nan
-        return summary
-
-
-# ==========================================
 # TRAIN / EVAL
 # ==========================================
 def train_epoch(model, dataloader, criterion, optimizer, device, metrics_mgr,
@@ -626,8 +427,8 @@ def run_training(vars_list=VARS_LIST, train_dir=None, test_dir=None, batch_size=
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
-    train_metrics_mgr = MaskedMetrics(vars_list)
-    test_metrics_mgr = MaskedMetrics(vars_list)
+    train_metrics_mgr = MaskedMetrics(vars_list, MODE_NAMES)
+    test_metrics_mgr = MaskedMetrics(vars_list, MODE_NAMES)
     train_losses, test_losses = [], []
     train_recons, test_recons = [], []
     train_kls, test_kls = [], []
@@ -1361,22 +1162,6 @@ def inferencia_by_sample_case2(model, clean_samples_cthw, channel_idx, device,
 
 #     return pred_hat  #T, C, H, W 
 
-
-
-@dataclass
-class SampleMetadata:
-    """Everything needed to title/name/geolocate a plot for one sample."""
-    source_file: str
-    track_id: Optional[str]
-    season: Optional[str]
-    basin: Optional[str]
-    rank: Optional[str]
-    win_idx: Optional[str]
-    lat: Optional[np.ndarray]           # 1D array, length H
-    lon: Optional[np.ndarray]           # 1D array, length W
-    cyclone_center_lat: Optional[float]
-    cyclone_center_lon: Optional[float]
-    time_str: Optional[str]             # e.g. "2020-09-14T06"
 
 
 def build_comparison_filename(metadata: Optional["SampleMetadata"], recon_type: str, images_dir: str) -> str:

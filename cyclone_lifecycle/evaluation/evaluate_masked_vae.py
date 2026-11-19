@@ -1,5 +1,5 @@
 """
-evaluation_test.py
+evaluate_masked_vae.py
 Evaluate the masked cyclone VAE on the test set and compare it with simple baselines.
 
 Scenarios (all masks are seeded, so every method sees exactly the same missing data):
@@ -24,7 +24,6 @@ Outputs in out_dir: metrics.json, metrics.csv, summary.png, examples_spatial.png
 """
 import csv
 import json
-import math
 from pathlib import Path
 
 import matplotlib
@@ -35,7 +34,8 @@ from torch.utils.data import DataLoader
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from vae_case1_case2 import VAR_GROUPS, CycloneVAE, _random_blocks, build_model_input
+from ..metrics import MaskedRecoveryAccumulator, summarize_masked_recovery
+from ..models.vae_case1_case2 import VAR_GROUPS, CycloneVAE, _random_blocks, build_model_input
 
 IMSHOW_ORIGIN = "lower"   # use "upper" if your latitude axis is stored north -> south
 
@@ -125,63 +125,6 @@ def predict_variable(model, x, mask, reg):
         pr[:, M] = torch.einsum("bohw,om->bmhw", x[:, O], Wm) + bm.view(1, -1, 1, 1)
         out["Regr"] = pr
     return out
-
-
-# =====================================================================================================
-# METRICS (streaming, missing entries only)
-# =====================================================================================================
-class Acc:
-    def __init__(self, C):
-        z = lambda: np.zeros(C, dtype=np.float64)
-        self.sq, self.ab, self.bi, self.tsq, self.n = z(), z(), z(), z(), z()
-        self.w = np.zeros(4)   # wind speed (physical): sum sq, sum abs, sum err, count
-
-    @torch.no_grad()
-    def add(self, pred, target, mask, mean, std, uv):
-        err = (pred - target).double()
-        t = target.double()
-        m = mask.double()
-        red = lambda a: a.sum(dim=(0, 2, 3)).cpu().numpy()
-        self.sq += red(err ** 2 * m)
-        self.ab += red(err.abs() * m)
-        self.bi += red(err * m)
-        self.tsq += red(t ** 2 * m)
-        self.n += red(m)
-        if uv is not None:
-            iu, iv = uv
-            mm = mask[:, iu] & mask[:, iv]
-            if mm.any():
-                pu = pred[:, iu].double() * std[iu] + mean[iu]
-                pv = pred[:, iv].double() * std[iv] + mean[iv]
-                tu = target[:, iu].double() * std[iu] + mean[iu]
-                tv = target[:, iv].double() * std[iv] + mean[iv]
-                e = (torch.hypot(pu, pv) - torch.hypot(tu, tv))[mm]
-                self.w += np.array([(e ** 2).sum().item(), e.abs().sum().item(), e.sum().item(), float(mm.sum())])
-
-
-def summarize(acc, vars_list, std_np):
-    res = {"per_variable": {}, "wind_speed": None}
-    for i, v in enumerate(vars_list):
-        n = acc.n[i]
-        if n == 0:
-            continue
-        mse = acc.sq[i] / n
-        res["per_variable"][v] = {
-            "n": int(n),
-            "rmse_norm": float(math.sqrt(mse)),
-            "mae_norm": float(acc.ab[i] / n),
-            "bias_norm": float(acc.bi[i] / n),
-            "skill": float(1.0 - acc.sq[i] / max(acc.tsq[i], 1e-12)),
-            "rmse_phys": float(math.sqrt(mse) * std_np[i]),
-            "mae_phys": float(acc.ab[i] / n * std_np[i]),
-            "bias_phys": float(acc.bi[i] / n * std_np[i]),
-        }
-    n_tot = acc.n.sum()
-    res["overall_rmse_norm"] = float(math.sqrt(acc.sq.sum() / n_tot)) if n_tot > 0 else float("nan")
-    if acc.w[3] > 0:
-        res["wind_speed"] = {"n": int(acc.w[3]), "rmse_phys": float(math.sqrt(acc.w[0] / acc.w[3])),
-                             "mae_phys": float(acc.w[1] / acc.w[3]), "bias_phys": float(acc.w[2] / acc.w[3])}
-    return res
 
 
 def print_table(results, scen, methods, vars_list):
@@ -410,7 +353,7 @@ def run_evaluation(checkpoint_path, test_ds, train_ds=None, out_dir="eval_out", 
     all_scen = list(SPATIAL_SCENARIOS) + list(var_scen)
     methods_of = {sc: (["VAE", "Interp", "Clim"] if sc in SPATIAL_SCENARIOS
                        else ["VAE"] + (["Regr"] if has_regr else []) + ["Clim"]) for sc in all_scen}
-    accs = {sc: {m: Acc(C) for m in methods_of[sc]} for sc in all_scen}
+    accs = {sc: {m: MaskedRecoveryAccumulator(C) for m in methods_of[sc]} for sc in all_scen}
     gens = {}
     for sc in SPATIAL_SCENARIOS:
         gens[sc] = torch.Generator(device=device)
@@ -431,7 +374,11 @@ def run_evaluation(checkpoint_path, test_ds, train_ds=None, out_dir="eval_out", 
             for m, p in predict_variable(model, x, mask, regress[gi] if has_regr else None).items():
                 accs[sc][m].add(p, x, mask, mean_t, std_t, uv)
 
-    results = {sc: {m: summarize(a, vars_list, std_np) for m, a in accs[sc].items()} for sc in all_scen}
+    results = {
+        sc: {method: summarize_masked_recovery(acc, vars_list, std_np)
+             for method, acc in accs[sc].items()}
+        for sc in all_scen
+    }
     for sc in all_scen:
         print_table(results, sc, methods_of[sc], vars_list)
 
@@ -466,7 +413,7 @@ def run_evaluation(checkpoint_path, test_ds, train_ds=None, out_dir="eval_out", 
 
 if __name__ == "__main__":
     # >>> adapt this import to the file where your dataset class and constants live <<<
-    from vae_case1_case2 import (
+    from ..models.vae_case1_case2 import (
         CHECKPOINT,
         TEST_DIR,
         TRAIN_DIR,

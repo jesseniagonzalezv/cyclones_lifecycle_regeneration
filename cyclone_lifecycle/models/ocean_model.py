@@ -33,8 +33,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import config as cfg
-from data import denormalize
+from .. import config as cfg
+from ..dataset import denormalize
 
 ATM = ["10u", "10v", "msl"]
 OCN = ["avg_tos", "avg_zos", "avg_sos", "avg_mlotst125"]
@@ -501,7 +501,7 @@ def main(argv=None):
     p.add_argument("--n-plot", type=int, default=10, help="figures per plotted scenario (metrics use ALL windows of the split)")
     args = p.parse_args(argv)
     stages = [s.strip() for s in args.stage.split(",")]
-    from data import CyclonePatchDataset
+    from ..dataset import CyclonePatchDataset
     device = cfg.DEVICE
     set_tag(args.tag)
     OUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import config as cfg
+from .. import config as cfg
 
 GROUPS = {"atm": ["10u", "10v", "msl"], "ocean": ["avg_tos", "avg_zos", "avg_sos", "avg_mlotst125"]}
 OTHER = {"atm": "ocean", "ocean": "atm"}
@@ -156,7 +156,7 @@ def main():
     p.add_argument("--base", type=int, default=32)
     args = p.parse_args()
 
-    from data import CyclonePatchDataset
+    from ..dataset import CyclonePatchDataset
     train_ds = CyclonePatchDataset(cfg.TRAIN_DIR, variables=cfg.VARS_LIST)
     val_ds = CyclonePatchDataset(cfg.VAL_DIR, variables=cfg.VARS_LIST, stats_dict=train_ds.stats)
     test_ds = CyclonePatchDataset(cfg.TEST_DIR, variables=cfg.VARS_LIST, stats_dict=train_ds.stats)

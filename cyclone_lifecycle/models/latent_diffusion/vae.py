@@ -5,12 +5,12 @@ The VAE sees every day independently; all temporal reasoning is left to the diff
 import os
 from typing import Optional, Tuple
 
-import config as cfg
+from ... import config as cfg
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data import PatchMeanTransform
+from ...dataset import PatchMeanTransform
 
 
 class ResidualBlock(nn.Module):

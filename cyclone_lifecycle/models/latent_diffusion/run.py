@@ -1,12 +1,12 @@
 """
 run.py - run any subset of the pipeline. Each stage reads its inputs from disk, so you never repeat earlier work.
 
-    python run.py --stage all                    # vae -> latents -> diffusion -> eval (skips what already exists)
-    python run.py --stage diffusion              # only (re)train the diffusion: needs just the latent cache
-    python run.py --stage eval                   # only evaluate: whole test set metrics + N_PLOT figures
-    python run.py --stage latents,diffusion      # new VAE checkpoint -> recompute latents and retrain diffusion
-    python run.py --stage eval --scenarios mid,last --n-ensemble 4 --ddim-steps 50
-    python run.py --stage diffusion --force      # retrain even if a checkpoint exists
+    python -m cyclone_lifecycle.models.latent_diffusion.run --stage all
+    python -m cyclone_lifecycle.models.latent_diffusion.run --stage diffusion
+    python -m cyclone_lifecycle.models.latent_diffusion.run --stage eval
+    python -m cyclone_lifecycle.models.latent_diffusion.run --stage latents,diffusion
+    python -m cyclone_lifecycle.models.latent_diffusion.run --stage eval --scenarios mid,last --n-ensemble 4 --ddim-steps 50
+    python -m cyclone_lifecycle.models.latent_diffusion.run --stage diffusion --force
 
 Stages: vae | latents | diffusion | eval | all
 Stage inputs   : vae        <- NetCDF train/test
@@ -17,11 +17,11 @@ Stage inputs   : vae        <- NetCDF train/test
 import argparse
 from typing import Optional
 
-import config as cfg
+from ... import config as cfg
 import torch
-from diffusion import DiffusionSchedule, LatentUNetDenoiser, train_diffusion
-from evaluation import evaluate_latent_diffusion
-from latents import (
+from .diffusion import DiffusionSchedule, LatentUNetDenoiser, train_diffusion
+from .evaluation import evaluate_latent_diffusion
+from .latents import (
     CachedLatentDataset,
     build_latent_cache,
     check_split_leakage,
@@ -30,9 +30,9 @@ from latents import (
     load_latent_cache,
 )
 from torch.utils.data import DataLoader
-from vae import CycloneVAE_Diffusion, load_vae, train_vae
+from .vae import CycloneVAE_Diffusion, load_vae, train_vae
 
-from data import CyclonePatchDataset, PatchMeanTransform, fit_anomaly_scale
+from ...dataset import CyclonePatchDataset, PatchMeanTransform, fit_anomaly_scale
 
 STAGES = ["vae", "latents", "diffusion", "eval"]
 

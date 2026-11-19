@@ -23,7 +23,7 @@ mpl.rcParams.update(
 	}
 )
 
-METRICS_DIR = Path(__file__).parent / "metrics"
+METRICS_DIR = Path(__file__).resolve().parents[2] / "metrics"
 VARIABLE_ORDER = ["10u", "10v", "msl", "avg_tos", "avg_zos", "avg_sos", "avg_mlotst125"]
 # MODEL_ORDER = ["VideoMAE", "masked VAE", "Diffusion", "Linear Interpolation"]
 MODEL_ORDER = ["VideoMAE", "masked VAE", "Diffusion", "Diffusion + ocean residual", "Linear Interpolation"]
